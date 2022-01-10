@@ -62,6 +62,7 @@ public class StarRocksDynamicSinkFunction<T> extends RichSinkFunction<T> impleme
 
     // state only works with `StarRocksSinkSemantic.EXACTLY_ONCE`
     private transient ListState<Tuple2<String, List<byte[]>>> checkpointedState;
+    private transient ListState<Tuple2<String, Map<String, byte[]>>> checkpointedUpsertState;
  
     public StarRocksDynamicSinkFunction(StarRocksSinkOptions sinkOptions, TableSchema schema, StarRocksIRowTransformer<T> rowTransformer) {
         this.sinkManager = new StarRocksSinkManager(sinkOptions, schema);
@@ -102,16 +103,19 @@ public class StarRocksDynamicSinkFunction<T> extends RichSinkFunction<T> impleme
             totalInvokeRowsTime.inc(System.nanoTime() - start);
             return;
         }
-        if (value instanceof RowData && !sinkOptions.supportUpsertDelete() && !RowKind.INSERT.equals(((RowData)value).getRowKind())) {
-            // only primary key table support `update` and `delete`
-            return;
-        }
 
-        if (value instanceof RowData && RowKind.UPDATE_BEFORE.equals(((RowData)value).getRowKind())) {
-            // write UPDATE_BEFORE is not necessary
-            // In a table under the primary key model, it is possible to have a data whose UPDATE_BEFORE and UPDATE_AFTER
-            // are not in the same batch, and this data will not be found when queried from StarRocks between the two batches.
-            return;
+        if (value instanceof RowData) {
+            if (RowKind.UPDATE_BEFORE.equals(((RowData)value).getRowKind())) {
+                // write UPDATE_BEFORE is not necessary
+                // In a table under the primary key model, it is possible to have a data whose UPDATE_BEFORE and UPDATE_AFTER
+                // are not in the same batch, and this data will not be found when queried from StarRocks between the two batches.
+                return;
+            }
+
+            if (!sinkOptions.supportPreMerge() && !sinkOptions.supportUpsertDelete() && !RowKind.INSERT.equals(((RowData)value).getRowKind())) {
+                // only primary/unique key table support `update` and `delete`
+                return;
+            }
         }
 
         if (value instanceof NestedRowData) {
@@ -141,9 +145,21 @@ public class StarRocksDynamicSinkFunction<T> extends RichSinkFunction<T> impleme
                 Alter alter = (Alter) stmt;
             }
         }
-        sinkManager.writeRecord(
-            serializer.serialize(rowTransformer.transform(value, sinkOptions.supportUpsertDelete()))
-        );
+
+        Object[] transformedData = rowTransformer.transform(value, sinkOptions.supportUpsertDelete());
+
+        if (sinkOptions.supportPreMerge()) {
+            int uniqueKeyFieldCount = sinkOptions.getUniqueKeyFieldCount();
+            StringBuilder uniqueKey = new StringBuilder();
+            for (int i = 0; i < uniqueKeyFieldCount; i++) {
+                uniqueKey.append(transformedData[i]);
+            }
+
+            sinkManager.writeRecordPreMerge(serializer.serialize(transformedData), uniqueKey.toString());
+        } else {
+            sinkManager.writeRecord(serializer.serialize(transformedData));
+        }
+
         totalInvokeRows.inc(1);
         totalInvokeRowsTime.inc(System.nanoTime() - start);
     }
@@ -159,14 +175,28 @@ public class StarRocksDynamicSinkFunction<T> extends RichSinkFunction<T> impleme
                 TypeInformation.of(new TypeHint<Tuple2<String, List<byte[]>>>(){})
             );
         checkpointedState = context.getOperatorStateStore().getListState(descriptor);
+
+        ListStateDescriptor<Tuple2<String, Map<String, byte[]>>> upsertDescriptor =
+                new ListStateDescriptor<>(
+                        "upsert-buffered-rows",
+                        TypeInformation.of(new TypeHint<Tuple2<String, Map<String, byte[]>>>(){})
+                );
+        checkpointedUpsertState = context.getOperatorStateStore().getListState(upsertDescriptor);
     }
 
     @Override
     public synchronized void snapshotState(FunctionSnapshotContext context) throws Exception {
         if (StarRocksSinkSemantic.EXACTLY_ONCE.equals(sinkOptions.getSemantic())) {
-            flushPreviousState();
             // save state
-            checkpointedState.add(new Tuple2<>(sinkManager.createBatchLabel(), new ArrayList<>(sinkManager.getBufferedBatchList())));
+            if (sinkOptions.supportPreMerge()) {
+                HashMap<String, byte[]> bufferedData = new HashMap<>(sinkManager.getBufferedBatchData());
+                flushPreviousState();
+                checkpointedUpsertState.add(new Tuple2<>(sinkManager.createBatchLabel(), bufferedData));
+            } else {
+                ArrayList<byte[]> bufferedData = new ArrayList<>(sinkManager.getBufferedBatchList());
+                flushPreviousState();
+                checkpointedState.add(new Tuple2<>(sinkManager.createBatchLabel(), bufferedData));
+            }
             return;
         }
         sinkManager.flush(sinkManager.createBatchLabel(), true);
@@ -182,11 +212,22 @@ public class StarRocksDynamicSinkFunction<T> extends RichSinkFunction<T> impleme
     }
 
     private void flushPreviousState() throws Exception {
-        // flush the batch saved at the previous checkpoint
-        for (Tuple2<String, List<byte[]>> state : checkpointedState.get()) {
-            sinkManager.setBufferedBatchList(state.f1);
-            sinkManager.flush(state.f0, true);
+        if (sinkOptions.supportPreMerge()) {
+            // flush the batch saved at the previous checkpoint
+            for (Tuple2<String, Map<String, byte[]>> state : checkpointedUpsertState.get()) {
+                sinkManager.setBufferedBatchData(state.f1);
+                sinkManager.flush(state.f0, true);
+            }
+            checkpointedUpsertState.clear();
+        } else {
+            // flush the batch saved at the previous checkpoint
+            for (Tuple2<String, List<byte[]>> state : checkpointedState.get()) {
+                sinkManager.setBufferedBatchList(state.f1);
+                sinkManager.flush(state.f0, true);
+            }
+            checkpointedState.clear();
         }
-        checkpointedState.clear();
+
+
     }
 }

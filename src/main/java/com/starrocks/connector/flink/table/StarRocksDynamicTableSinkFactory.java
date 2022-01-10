@@ -64,6 +64,7 @@ public class StarRocksDynamicTableSinkFactory implements DynamicTableSinkFactory
         optionalOptions.add(StarRocksSinkOptions.SINK_SEMANTIC);
         optionalOptions.add(StarRocksSinkOptions.SINK_BATCH_OFFER_TIMEOUT);
         optionalOptions.add(StarRocksSinkOptions.SINK_PARALLELISM);
+        optionalOptions.add(StarRocksSinkOptions.SINK_PRE_MERGE);
         return optionalOptions;
     }
 }

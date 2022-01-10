@@ -21,17 +21,18 @@ import org.apache.flink.table.types.logical.LogicalTypeRoot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.Arrays;
-import java.util.concurrent.TimeUnit;
-import java.io.IOException;
-import java.io.Serializable;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.io.IOException;
+import java.io.Serializable;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.ScheduledExecutorService;
@@ -102,6 +103,7 @@ public class StarRocksSinkManager implements Serializable {
     static final String EOF = "EOF";
 
     private final ArrayList<byte[]> buffer = new ArrayList<>();
+    private final LinkedHashMap<String, byte[]> upsertBuffer = new LinkedHashMap<>();
     private int batchCount = 0;
     private long batchSize = 0;
     volatile boolean closed = false;
@@ -218,16 +220,38 @@ public class StarRocksSinkManager implements Serializable {
             buffer.add(bts);
             batchCount++;
             batchSize += bts.length;
-            if (StarRocksSinkSemantic.EXACTLY_ONCE.equals(sinkOptions.getSemantic())) {
-                return;
-            }
-            if (batchCount >= sinkOptions.getSinkMaxRows() || batchSize >= sinkOptions.getSinkMaxBytes()) {
-                String label = createBatchLabel();
-                LOG.info(String.format("StarRocks buffer Sinking triggered: rows[%d] label[%s].", batchCount, label));
-                flush(label, false);
-            }
+            flushConditional();
         } catch (Exception e) {
             throw new IOException("Writing records to StarRocks failed.", e);
+        }
+    }
+
+    public final synchronized void writeRecordPreMerge(String record, String uniqueKey) throws IOException {
+        checkFlushException();
+        try {
+            byte[] bts = record.getBytes(StandardCharsets.UTF_8);
+            byte[] preBts = upsertBuffer.get(uniqueKey);
+            upsertBuffer.put(uniqueKey, bts);
+            if (preBts == null) {
+                batchCount++;
+                batchSize += bts.length;
+            } else {
+                batchSize += bts.length - preBts.length;
+            }
+            flushConditional();
+        } catch (Exception e) {
+            throw new IOException("Writing records to StarRocks failed.", e);
+        }
+    }
+
+    public void flushConditional() throws Exception {
+        if (StarRocksSinkSemantic.EXACTLY_ONCE.equals(sinkOptions.getSemantic())) {
+            return;
+        }
+        if (batchCount >= sinkOptions.getSinkMaxRows() || batchSize >= sinkOptions.getSinkMaxBytes()) {
+            String label = createBatchLabel();
+            LOG.info(String.format("StarRocks buffer Sinking triggered: rows[%d] label[%s].", batchCount, label));
+            flush(label, false);
         }
     }
 
@@ -239,14 +263,12 @@ public class StarRocksSinkManager implements Serializable {
             }
             return;
         }
-        offer(new Tuple3<>(label, batchSize,  new ArrayList<>(buffer)));
+        offer(new Tuple3<>(label, batchSize,  getBuffer()));
         if (waitUtilDone) {
             // wait the last flush
             waitAsyncFlushingDone();
         }
-        buffer.clear();
-        batchCount = 0;
-        batchSize = 0;
+        clearBuffer();
     }
 
     public synchronized void close() {
@@ -291,12 +313,38 @@ public class StarRocksSinkManager implements Serializable {
         if (!StarRocksSinkSemantic.EXACTLY_ONCE.equals(sinkOptions.getSemantic())) {
             return;
         }
-        this.buffer.clear();
-        batchCount = 0;
-        batchSize = 0;
+        clearBuffer();
         for (byte[] row : list) {
             writeRecord(new String(row, StandardCharsets.UTF_8));
         }
+    }
+
+    public Map<String, byte[]> getBufferedBatchData() {
+        return upsertBuffer;
+    }
+
+    public void setBufferedBatchData(Map<String, byte[]> batchData) throws IOException {
+        if (!StarRocksSinkSemantic.EXACTLY_ONCE.equals(sinkOptions.getSemantic())) {
+            return;
+        }
+        clearBuffer();
+        for (Map.Entry<String, byte[]> row : batchData.entrySet()) {
+            writeRecordPreMerge(new String(row.getValue(), StandardCharsets.UTF_8), row.getKey());
+        }
+    }
+
+    public ArrayList<byte[]> getBuffer() {
+        return new ArrayList<>(sinkOptions.supportPreMerge() ? upsertBuffer.values() : buffer);
+    }
+
+    public void clearBuffer() {
+        if (sinkOptions.supportPreMerge()) {
+            upsertBuffer.clear();
+        } else {
+            buffer.clear();
+        }
+        batchCount = 0;
+        batchSize = 0;
     }
 
     /**
@@ -397,6 +445,9 @@ public class StarRocksSinkManager implements Serializable {
             return;
         }
         Optional<UniqueConstraint> constraint = flinkSchema.getPrimaryKey();
+        // The primary key fields of the StarRocks table must be at the top of the list
+        constraint.ifPresent(uniqueConstraint -> sinkOptions.setUniqueKeyFieldCount(uniqueConstraint.getColumns().size()));
+
         List<Map<String, Object>> rows = starrocksQueryVisitor.getTableColumnsMetaData();
         if (rows == null || rows.isEmpty()) {
             throw new IllegalArgumentException("Couldn't get the sink table's column info.");
@@ -427,7 +478,7 @@ public class StarRocksSinkManager implements Serializable {
         if (flinkSchema.getFieldCount() != rows.size()) {
             throw new IllegalArgumentException("Fields count of "+this.sinkOptions.getTableName()+" mismatch. \nflinkSchema["
                     +flinkSchema.getFieldNames().length+"]:"
-                    +Arrays.asList( flinkSchema.getFieldNames()).stream().collect(Collectors.joining(","))
+                    + Arrays.asList( flinkSchema.getFieldNames()).stream().collect(Collectors.joining(","))
                     +"\n realTab["+rows.size()+"]:"
                     +rows.stream().map((r)-> String.valueOf(r.get("COLUMN_NAME"))).collect(Collectors.joining(",")));
         }

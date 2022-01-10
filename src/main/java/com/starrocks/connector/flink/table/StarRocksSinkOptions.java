@@ -74,6 +74,8 @@ public class StarRocksSinkOptions implements Serializable {
         .longType().defaultValue(600000L).withDescription("Offer to flushQueue timeout in millisecond.");
     public static final ConfigOption<Integer> SINK_METRIC_HISTOGRAM_WINDOW_SIZE = ConfigOptions.key("sink.metric.histogram-window-size")
         .intType().defaultValue(100).withDescription("Window size of histogram metrics.");
+    public static final ConfigOption<Boolean> SINK_PRE_MERGE = ConfigOptions.key("sink.pre-merge")
+            .booleanType().defaultValue(true).withDescription("Enable pre-merge if true.");
 
     public static final ConfigOption<Integer> SINK_PARALLELISM = FactoryUtil.SINK_PARALLELISM;
 
@@ -87,12 +89,16 @@ public class StarRocksSinkOptions implements Serializable {
     private final Map<String, String> tableOptionsMap;
     private StarRocksSinkSemantic sinkSemantic;
     private boolean supportUpsertDelete;
+    private final boolean sinkPreMerge;
+    // unique constraint filed count.
+    private int uniqueKeyFieldCount;
 
     public StarRocksSinkOptions(ReadableConfig options, Map<String, String> optionsMap) {
         this.tableOptions = options;
         this.tableOptionsMap = optionsMap;
         parseSinkStreamLoadProperties();
         this.validate();
+        this.sinkPreMerge = tableOptions.get(SINK_PRE_MERGE);
     }
 
     private void validate() {
@@ -196,6 +202,18 @@ public class StarRocksSinkOptions implements Serializable {
 
     public boolean supportUpsertDelete() {
         return supportUpsertDelete;
+    }
+
+    public void setUniqueKeyFieldCount(int count) {
+        uniqueKeyFieldCount = count;
+    }
+
+    public int getUniqueKeyFieldCount() {
+        return uniqueKeyFieldCount;
+    }
+
+    public boolean supportPreMerge() {
+        return sinkPreMerge && uniqueKeyFieldCount > 0;
     }
 
     private void validateStreamLoadUrl() {
